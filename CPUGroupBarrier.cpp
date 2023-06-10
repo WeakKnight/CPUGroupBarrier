@@ -5,17 +5,24 @@
 #include <atomic>
 #include <unordered_map>
 
-struct CPUThreadDispatcher
+#include <windows.h>
+
+#define BLOCK_WIDTH 8
+#define CONCAT_IMPL(a, b) a##b
+#define CONCAT(a, b) CONCAT_IMPL(a, b)
+
+struct ThreadDispatcher
 {
-	CPUThreadDispatcher()
+	ThreadDispatcher()
 	{
+		mCurrentBarrierSize = 0;
 		mCompletionFunction.dispatcher = this;
-		mThreads.reserve(256llu);
+		mThreads.reserve(BLOCK_WIDTH);
 	}
 
 	struct GroupContext
 	{
-		GroupContext(CPUThreadDispatcher* dispatcher)
+		GroupContext(ThreadDispatcher* dispatcher)
 			: mpDispatcher(dispatcher)
 		{
 		}
@@ -26,7 +33,7 @@ struct CPUThreadDispatcher
 			mpDispatcher->GetBarrier(mpDispatcher->mCurrentBarrierSize)->arrive_and_drop();
 		}
 
-		CPUThreadDispatcher* mpDispatcher;
+		ThreadDispatcher* mpDispatcher;
 	};
 
 	struct CompletionFunction
@@ -36,7 +43,7 @@ struct CPUThreadDispatcher
 			dispatcher->mCurrentBarrierSize = dispatcher->mAliveThreadCount;
 		}
 
-		CPUThreadDispatcher* dispatcher;
+		ThreadDispatcher* dispatcher;
 	};
 
 	std::barrier<CompletionFunction>* GetBarrier(uint32_t num)
@@ -59,39 +66,32 @@ struct CPUThreadDispatcher
 		GetBarrier(mCurrentBarrierSize)->arrive_and_wait();
 	}
 
-	void Dispatch(uint32_t blockWidth, uint32_t blockHeight, uint32_t blockDepth)
+	void Dispatch()
 	{
-		mCurrentBarrierSize = blockWidth * blockHeight * blockDepth;
+		mCurrentBarrierSize = BLOCK_WIDTH;
 		mAliveThreadCount = mCurrentBarrierSize;
 
-		auto work = [&](uint32_t x, uint32_t y, uint32_t z) {
+		auto work = [&](uint32_t threadIndex) {
 			GroupContext groupContext(this);
 
-			printf("Thread %u, %u, %u Initialized. \n", x, y, z);
-
-			if (x == 0)
-			{
-				return;
-			}
+			printf("[ThreadDispatcher] Thread %u Initialized. \n", threadIndex);
 
 			GroupBlock();
 
-			printf("Thread %u, %u, %u Working. \n", x, y, z);
+			printf("[ThreadDispatcher] Thread %u Task A Done. \n", threadIndex);
 
 			GroupBlock();
 
-			printf("Thread %u, %u, %u Done. \n", x, y, z);
+			printf("[ThreadDispatcher] Thread %u Task B Done. \n", threadIndex);
+
+			GroupBlock();
+
+			printf("[ThreadDispatcher] Thread %u Finalized. \n", threadIndex);
 		};
 
-		for (uint32_t x = 0; x < blockWidth; x++)
+		for (uint32_t x = 0; x < BLOCK_WIDTH; x++)
 		{
-			for (uint32_t y = 0; y < blockHeight; y++)
-			{
-				for (uint32_t z = 0; z < blockDepth; z++)
-				{
-					mThreads.emplace_back(work, x, y, z);
-				}
-			}
+			mThreads.emplace_back(work, x);
 		}
 	}
 
@@ -102,14 +102,75 @@ struct CPUThreadDispatcher
 	std::vector<std::jthread> mThreads;
 };
 
-struct CPUCoroutineDispatcher
+#define KERNEL_BEGIN                                                          \
+	std::unordered_map<uint16_t, uint16_t> completeThreadNums;                \
+	auto IncrementCompleteThreadNum = [&completeThreadNums](int lineNumber) { \
+		auto iter = completeThreadNums.find(lineNumber);                      \
+		if (iter == completeThreadNums.cend())                                \
+		{                                                                     \
+			completeThreadNums[lineNumber] = 1;                               \
+			return uint16_t(1);                                               \
+		}                                                                     \
+		else                                                                  \
+		{                                                                     \
+			iter->second++;                                                   \
+			return iter->second;                                              \
+		}                                                                     \
+	};                                                                        \
+	int state = 0;                                                            \
+	for (uint32_t threadIndex = 0; threadIndex < BLOCK_WIDTH; threadIndex++)  \
+	{                                                                         \
+		switch (state)                                                        \
+		{                                                                     \
+			case 0:
+
+#define GROUP_BARRIER                                        \
+	if (IncrementCompleteThreadNum(__LINE__) != BLOCK_WIDTH) \
+	{                                                        \
+		continue;                                            \
+	}                                                        \
+	else                                                     \
+	{                                                        \
+		threadIndex = 0;                                     \
+		state = __LINE__;                                    \
+	}                                                        \
+	case __LINE__:
+
+#define KERNEL_END \
+	}              \
+	}
+
+struct CoroutineDispatcher
 {
+	void Dispatch()
+	{
+		KERNEL_BEGIN
+
+		printf("[CoroutineDispatcher] Thread %u Initialized. \n", threadIndex);
+
+		GROUP_BARRIER
+
+		printf("[CoroutineDispatcher] Thread %u Task A Done. \n", threadIndex);
+
+		GROUP_BARRIER
+
+		printf("[CoroutineDispatcher] Thread %u Task B Done. \n", threadIndex);
+
+		GROUP_BARRIER
+
+		printf("[CoroutineDispatcher] Thread %u Finalized. \n", threadIndex);
+
+		KERNEL_END
+	}
 };
 
 int main()
 {
-	CPUThreadDispatcher dispatcher;
-	dispatcher.Dispatch(8, 1, 1);
+	ThreadDispatcher threadDispatcher;
+	threadDispatcher.Dispatch();
+
+	CoroutineDispatcher coroutineDispatcher;
+	coroutineDispatcher.Dispatch();
 
 	return 0;
 }
