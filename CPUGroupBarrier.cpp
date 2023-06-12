@@ -4,6 +4,7 @@
 #include <vector>
 #include <atomic>
 #include <unordered_map>
+#include <coroutine>
 
 #include <windows.h>
 
@@ -164,13 +165,103 @@ struct CoroutineDispatcher
 	}
 };
 
+struct resumable_thing
+{
+	struct promise_type
+	{
+		resumable_thing get_return_object()
+		{
+			return resumable_thing(std::coroutine_handle<promise_type>::from_promise(*this));
+		}
+		auto initial_suspend() { return std::suspend_never{}; }
+		auto final_suspend() noexcept { return std::suspend_never{}; }
+		void return_void() {}
+
+		void unhandled_exception() {}
+	};
+	std::coroutine_handle<promise_type> _coroutine = nullptr;
+	resumable_thing() = default;
+	resumable_thing(resumable_thing const&) = delete;
+	resumable_thing& operator=(resumable_thing const&) = delete;
+	resumable_thing(resumable_thing&& other)
+		: _coroutine(other._coroutine)
+	{
+		other._coroutine = nullptr;
+	}
+	resumable_thing& operator=(resumable_thing&& other)
+	{
+		if (&other != this)
+		{
+			_coroutine = other._coroutine;
+			other._coroutine = nullptr;
+		}
+	}
+	explicit resumable_thing(std::coroutine_handle<promise_type> coroutine)
+		: _coroutine(coroutine)
+	{
+	}
+	~resumable_thing()
+	{
+		if (_coroutine && _coroutine.done())
+		{
+			_coroutine.destroy();
+		}
+	}
+	void resume()
+	{
+		if (!_coroutine.done())
+		{
+			_coroutine.resume();
+		}
+	}
+
+	bool is_done() const { return _coroutine.done(); }
+};
+
+bool sHasRemainingResumable = true;
+
+resumable_thing counter(int i)
+{
+	// std::unordered_map<uint16_t, uint16_t> completeThreadNums;
+	// auto IncrementCompleteThreadNum = [&completeThreadNums](int lineNumber) {
+	//	auto iter = completeThreadNums.find(lineNumber);
+	//	if (iter == completeThreadNums.cend())
+	//	{
+	//		completeThreadNums[lineNumber] = 1;
+	//		return uint16_t(1);
+	//	}
+	//	else
+	//	{
+	//		iter->second++;
+	//		return iter->second;
+	//	}
+	// };
+
+	printf("[ThreadDispatcher] Thread %u Initialized. \n", i);
+
+	co_await std::suspend_always{};
+
+	printf("[ThreadDispatcher] Thread %u Task A Done. \n", i);
+
+	co_await std::suspend_always{};
+
+	printf("[ThreadDispatcher] Thread %u Finalized. \n", i);
+
+	sHasRemainingResumable = false;
+	co_return;
+}
+
 int main()
 {
-	ThreadDispatcher threadDispatcher;
-	threadDispatcher.Dispatch();
+	resumable_thing the_counter = counter(0);
 
-	CoroutineDispatcher coroutineDispatcher;
-	coroutineDispatcher.Dispatch();
+	while (sHasRemainingResumable)
+	{
+		if (!the_counter._coroutine.done())
+		{
+			the_counter.resume();
+		}
+	}
 
 	return 0;
 }
