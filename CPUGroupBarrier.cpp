@@ -121,26 +121,27 @@ struct CPUDispatcher
 	std::function<void(Vector3UInt, Vector3UInt, bool, CPUDispatcher*)> mKernel;
 };
 
-void ComputeMain(Vector3UInt groupIndex, Vector3UInt threadIndex, bool useRed, CPUDispatcher* dispatcher)
+#define BLOCK_BARRIER() dispatcher->GroupSync(useRed)
+#define Compute_Kernel(name) void ComputeKernel_##name(Vector3UInt groupIndex, Vector3UInt threadIndex, bool useRed, CPUDispatcher* dispatcher)
+
+Compute_Kernel(Main)
 {
 	printf("[ThreadDispatcher] Group %u Thread %u Initialized. \n", groupIndex.x, threadIndex.x);
 
-	dispatcher->GroupSync(useRed);
+	BLOCK_BARRIER();
 
-	printf("[ThreadDispatcher] Group %u Thread %u Task A Done. \n", groupIndex.x, threadIndex.x);
-
-	dispatcher->GroupSync(useRed);
-
-	printf("[ThreadDispatcher] Group %u Thread %u Task B Done. \n", groupIndex.x, threadIndex.x);
-
-	dispatcher->GroupSync(useRed);
+	for (uint taskIndex = 0; taskIndex < 2; taskIndex++)
+	{
+		printf("[ThreadDispatcher] Group %u Thread %u Task %u Done. \n", groupIndex.x, threadIndex.x, taskIndex);
+		BLOCK_BARRIER();
+	}
 
 	printf("[ThreadDispatcher] Group %u Thread %u Finalized. \n", groupIndex.x, threadIndex.x);
 }
 
 int main()
 {
-	CPUDispatcher dispatcher(Vector3UInt(8, 1, 1), ComputeMain);
+	CPUDispatcher dispatcher(Vector3UInt(8, 1, 1), ComputeKernel_Main);
 	dispatcher.Dispatch(Vector3UInt(2, 1, 1));
 
 	return 0;
