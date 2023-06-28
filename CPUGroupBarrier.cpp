@@ -2,24 +2,35 @@
 #include <iostream>
 #include <thread>
 #include <vector>
-#include <atomic>
-#include <unordered_map>
-#include <coroutine>
-#include <optional>
+#include <functional>
 
-#include <windows.h>
+typedef uint32_t uint;
 
-#define BLOCK_WIDTH 8
-#define CONCAT_IMPL(a, b) a##b
-#define CONCAT(a, b) CONCAT_IMPL(a, b)
+struct Vector3UInt
+{
+	Vector3UInt()
+		: x(0), y(0), z(0)
+	{
+	}
+
+	Vector3UInt(uint inX, uint inY, uint inZ)
+		: x(inX), y(inY), z(inZ)
+	{
+	}
+
+	uint x;
+	uint y;
+	uint z;
+};
 
 struct CPUDispatcher
 {
-	CPUDispatcher()
-		: mCompletionFunction(CompletionFunction()), mBarrierRed(std::barrier<CompletionFunction>(BLOCK_WIDTH, mCompletionFunction)), mBarrierBlack(std::barrier<CompletionFunction>(BLOCK_WIDTH, mCompletionFunction))
+	CPUDispatcher(Vector3UInt blockSize, std::function<void(Vector3UInt, Vector3UInt, bool, CPUDispatcher*)> kernel)
+		: mBlockSize(blockSize), mKernel(kernel),
+		mCompletionFunction(CompletionFunction()), mBarrierRed(std::barrier<CompletionFunction>(blockSize.x * blockSize.y * blockSize.z, mCompletionFunction)), mBarrierBlack(std::barrier<CompletionFunction>(blockSize.x * blockSize.y * blockSize.z, mCompletionFunction))
 	{
-		mThreadGroupRed.reserve(BLOCK_WIDTH);
-		mThreadGroupBlack.reserve(BLOCK_WIDTH);
+		mThreadGroupRed.reserve(blockSize.x * blockSize.y * blockSize.z);
+		mThreadGroupBlack.reserve(blockSize.x * blockSize.y * blockSize.z);
 	}
 
 	struct CompletionFunction
@@ -33,80 +44,70 @@ struct CPUDispatcher
 		}
 	};
 
-	void Dispatch(uint32_t groupWidth)
+	void Dispatch(Vector3UInt groupSize)
 	{
-		for (int i = 0; i < groupWidth; i++)
+
+		for (uint gridX = 0; gridX < groupSize.x; gridX++)
 		{
-			DispatchGroup(i);
-			mUseRed = !mUseRed;
+			for (uint gridY = 0; gridY < groupSize.y; gridY++)
+			{
+				for (uint gridZ = 0; gridZ < groupSize.z; gridZ++)
+				{
+					DispatchGroup(Vector3UInt(gridX, gridY, gridZ));
+					mUseRed = !mUseRed;
+				}
+			}
 		}
 
-		for (uint32_t x = 0; x < mThreadGroupRed.size(); x++)
+		for (uint32_t i = 0; i < mThreadGroupRed.size(); i++)
 		{
-			mThreadGroupRed[x].join();
+			mThreadGroupRed[i].join();
 		}
 		mThreadGroupRed.clear();
 
-		for (uint32_t x = 0; x < mThreadGroupBlack.size(); x++)
+		for (uint32_t i = 0; i < mThreadGroupBlack.size(); i++)
 		{
-			mThreadGroupBlack[x].join();
+			mThreadGroupBlack[i].join();
 		}
 		mThreadGroupBlack.clear();
 	}
 
-	void DispatchGroup(uint32_t gIndex)
+	void GroupSync(bool useRed)
 	{
-		auto work = [&](uint32_t groupIndex, uint32_t threadIndex, bool useRed) {
-			printf("[ThreadDispatcher] Group %u Thread %u Initialized. \n", groupIndex, threadIndex);
+		if (useRed)
+		{
+			mBarrierRed.arrive_and_wait();
+		}
+		else
+		{
+			mBarrierBlack.arrive_and_wait();
+		}
+	}
 
-			if (useRed)
-			{
-				mBarrierRed.arrive_and_wait();
-			}
-			else
-			{
-				mBarrierBlack.arrive_and_wait();
-			}
-
-			printf("[ThreadDispatcher] Group %u Thread %u Task A Done. \n", groupIndex, threadIndex);
-
-			if (useRed)
-			{
-				mBarrierRed.arrive_and_wait();
-			}
-			else
-			{
-				mBarrierBlack.arrive_and_wait();
-			}
-
-			printf("[ThreadDispatcher] Group %u Thread %u Task B Done. \n", groupIndex, threadIndex);
-
-			if (useRed)
-			{
-				mBarrierRed.arrive_and_wait();
-			}
-			else
-			{
-				mBarrierBlack.arrive_and_wait();
-			}
-
-			printf("[ThreadDispatcher] Group %u Thread %u Finalized. \n", groupIndex, threadIndex);
-		};
-
+	void DispatchGroup(Vector3UInt groupIndex)
+	{
 		std::vector<std::thread>& currentThreadGroup = mUseRed ? mThreadGroupRed : mThreadGroupBlack;
 		std::vector<std::thread>& otherThreadGroup = mUseRed ? mThreadGroupBlack : mThreadGroupRed;
 
-		for (uint32_t x = 0; x < BLOCK_WIDTH; x++)
+		for (uint32_t x = 0; x < mBlockSize.x; x++)
 		{
-			currentThreadGroup.emplace_back(work, gIndex, x, mUseRed);
+			for (uint32_t y = 0; y < mBlockSize.y; y++)
+			{
+				for (uint32_t z = 0; z < mBlockSize.z; z++)
+				{
+					currentThreadGroup.emplace_back(mKernel, groupIndex, Vector3UInt(x, y, z), mUseRed, this);
+				}
+			}
 		}
 
-		for (uint32_t x = 0; x < otherThreadGroup.size(); x++)
+		for (uint32_t i = 0; i < otherThreadGroup.size(); i++)
 		{
-			otherThreadGroup[x].join();
+			otherThreadGroup[i].join();
 		}
 		otherThreadGroup.clear();
 	}
+
+	Vector3UInt mBlockSize;
 
 	CompletionFunction mCompletionFunction;
 
@@ -116,12 +117,31 @@ struct CPUDispatcher
 	bool mUseRed = true;
 	std::vector<std::thread> mThreadGroupRed;
 	std::vector<std::thread> mThreadGroupBlack;
+
+	std::function<void(Vector3UInt, Vector3UInt, bool, CPUDispatcher*)> mKernel;
 };
+
+void ComputeMain(Vector3UInt groupIndex, Vector3UInt threadIndex, bool useRed, CPUDispatcher* dispatcher)
+{
+	printf("[ThreadDispatcher] Group %u Thread %u Initialized. \n", groupIndex.x, threadIndex.x);
+
+	dispatcher->GroupSync(useRed);
+
+	printf("[ThreadDispatcher] Group %u Thread %u Task A Done. \n", groupIndex.x, threadIndex.x);
+
+	dispatcher->GroupSync(useRed);
+
+	printf("[ThreadDispatcher] Group %u Thread %u Task B Done. \n", groupIndex.x, threadIndex.x);
+
+	dispatcher->GroupSync(useRed);
+
+	printf("[ThreadDispatcher] Group %u Thread %u Finalized. \n", groupIndex.x, threadIndex.x);
+}
 
 int main()
 {
-	CPUDispatcher dispatcher;
-	dispatcher.Dispatch(4);
+	CPUDispatcher dispatcher(Vector3UInt(8, 1, 1), ComputeMain);
+	dispatcher.Dispatch(Vector3UInt(2, 1, 1));
 
 	return 0;
 }
