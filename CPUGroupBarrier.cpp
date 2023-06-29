@@ -23,6 +23,46 @@ struct Vector3UInt
 	uint z;
 };
 
+struct CPUTimer
+{
+	void Start()
+	{
+		mStartTime = std::chrono::system_clock::now();
+		mCapturing = true;
+	}
+
+	void Stop()
+	{
+		mEndTime = std::chrono::system_clock::now();
+		mCapturing = false;
+	}
+
+	// in microseconds
+	float GetElapsedTime() const
+	{
+		std::chrono::time_point<std::chrono::system_clock> endTime;
+		if (mCapturing)
+		{
+			endTime = std::chrono::system_clock::now();
+		}
+		else
+		{
+			endTime = mEndTime;
+		}
+
+		return (float)std::chrono::duration_cast<std::chrono::milliseconds>(endTime - mStartTime).count();
+	}
+
+	void Print(const std::string& name)
+	{
+		printf("%s takes %f ms\n", name.c_str(), GetElapsedTime());
+	}
+
+	std::chrono::time_point<std::chrono::system_clock> mStartTime;
+	std::chrono::time_point<std::chrono::system_clock> mEndTime;
+	bool mCapturing = false;
+};
+
 struct CPUDispatcher
 {
 	CPUDispatcher(Vector3UInt blockSize, std::function<void(Vector3UInt, Vector3UInt, bool, CPUDispatcher*)> kernel)
@@ -255,41 +295,6 @@ Compute_Kernel_Begin(ParallelReduction)
 }
 Compute_Kernel_End
 
-struct CPUTimer
-{
-	void Start()
-	{
-		mStartTime = std::chrono::system_clock::now();
-		mCapturing = true;
-	}
-
-	void Stop()
-	{
-		mEndTime = std::chrono::system_clock::now();
-		mCapturing = false;
-	}
-
-	// in microseconds
-	float GetElapsedTime() const
-	{
-		std::chrono::time_point<std::chrono::system_clock> endTime;
-		if (mCapturing)
-		{
-			endTime = std::chrono::system_clock::now();
-		}
-		else
-		{
-			endTime = mEndTime;
-		}
-
-		return (float)std::chrono::duration_cast<std::chrono::milliseconds>(endTime - mStartTime).count();
-	}
-
-	std::chrono::time_point<std::chrono::system_clock> mStartTime;
-	std::chrono::time_point<std::chrono::system_clock> mEndTime;
-	bool mCapturing = false;
-};
-
 int main()
 {
 	CPUDispatcher dispatcher(Vector3UInt(512, 1, 1), ComputeKernel_ParallelReduction);
@@ -297,9 +302,7 @@ int main()
 	CPUTimer timer;
 	timer.Start();
 	dispatcher.Dispatch(Vector3UInt(1, 1, 1));
-	timer.Stop();
-
-	printf("Parallel Sum takes %f milliseconds\n", timer.GetElapsedTime());
+	timer.Print("Parallel Sum");
 
 	timer.Start();
 	int res = 0;
@@ -308,9 +311,7 @@ int main()
 		res += i;
 	}
 	printf("Final Result: %u\n", res);
-	timer.Stop();
+	timer.Print("Serial Sum");
 	
-	printf("Serial Sum takes %f milliseconds", timer.GetElapsedTime());
-
 	return 0;
 }
