@@ -26,9 +26,7 @@ struct Vector3UInt
 struct CPUDispatcher
 {
 	CPUDispatcher(Vector3UInt blockSize, std::function<void(Vector3UInt, Vector3UInt, bool, CPUDispatcher*)> kernel)
-		: mBlockSize(blockSize), mKernel(kernel),
-		mRedCompletionFunction(CompletionFunction(true, this)), 
-		mBlackCompletionFunction(CompletionFunction(false, this))
+		: mBlockSize(blockSize), mKernel(kernel), mRedCompletionFunction(CompletionFunction(true, this)), mBlackCompletionFunction(CompletionFunction(false, this))
 	{
 		const uint groupThreadCount = blockSize.x * blockSize.y * blockSize.z;
 		mRedAliveThreadCount = groupThreadCount;
@@ -72,6 +70,31 @@ struct CPUDispatcher
 		bool mIsRed;
 		CPUDispatcher* mpDispatcher;
 	};
+
+	void SetSharedMemorySize(uint byteSize)
+	{
+		if (mRedSharedMemory.capacity() < byteSize)
+		{
+			mRedSharedMemory.reserve(byteSize);
+		}
+
+		if (mBlackSharedMemory.capacity() < byteSize)
+		{
+			mBlackSharedMemory.reserve(byteSize);
+		}
+	}
+
+	void* GetSharedMemory(bool isRed)
+	{
+		if (isRed)
+		{
+			return mRedSharedMemory.data();
+		}
+		else
+		{
+			return mBlackSharedMemory.data();
+		}
+	}
 
 	void Dispatch(Vector3UInt groupSize)
 	{
@@ -118,7 +141,7 @@ struct CPUDispatcher
 		std::vector<std::thread>& otherThreadGroup = mUseRed ? mThreadGroupBlack : mThreadGroupRed;
 
 		const uint groupThreadCount = mBlockSize.x * mBlockSize.y * mBlockSize.z;
-		
+
 		if (mUseRed)
 		{
 			mRedAliveThreadCount = groupThreadCount;
@@ -136,7 +159,7 @@ struct CPUDispatcher
 			{
 				for (uint32_t z = 0; z < mBlockSize.z; z++)
 				{
-					currentThreadGroup.emplace_back(mKernel, groupIndex, Vector3UInt(x, y, z), mUseRed, this);
+					currentThreadGroup.emplace_back(mKernel, groupIndex, Vector3UInt(mBlockSize.x * groupIndex.x + x, mBlockSize.y * groupIndex.y + y, mBlockSize.z * groupIndex.z + z), mUseRed, this);
 				}
 			}
 		}
@@ -149,7 +172,7 @@ struct CPUDispatcher
 	}
 
 	Vector3UInt mBlockSize;
-	
+
 	std::function<void(Vector3UInt, Vector3UInt, bool, CPUDispatcher*)> mKernel;
 
 	CompletionFunction mRedCompletionFunction;
@@ -166,16 +189,22 @@ struct CPUDispatcher
 	std::atomic_uint mRedAliveThreadCount;
 	std::atomic_uint mBlackAliveThreadCount;
 
+	std::vector<uint8_t> mRedSharedMemory;
+	std::vector<uint8_t> mBlackSharedMemory;
+
 	uint mRedGroupThreadCount;
 	uint mBlackGroupThreadCount;
 };
 
-#define BLOCK_BARRIER() dispatcher->GroupSync(isRed)
+#define GROUP_BARRIER() dispatcher->GroupSync(isRed)
 #define Compute_Kernel_Begin(name)                                                                                    \
 	void ComputeKernel_##name(Vector3UInt groupIndex, Vector3UInt threadIndex, bool isRed, CPUDispatcher* dispatcher) \
 	{                                                                                                                 \
 		KernelScopeGuard scopeGuard(isRed, dispatcher);
 #define Compute_Kernel_End }
+
+#define SHARED_MEM(type) (type*)dispatcher->GetSharedMemory(isRed)
+
 struct KernelScopeGuard
 {
 	KernelScopeGuard(bool isRed, CPUDispatcher* dispatcher)
@@ -201,31 +230,87 @@ struct KernelScopeGuard
 	CPUDispatcher* mpDispatcher;
 };
 
-Compute_Kernel_Begin(Main)
+Compute_Kernel_Begin(ParallelReduction)
 {
-	if (threadIndex.x >= 4)
+	uint* sharedData = SHARED_MEM(uint);
+
+	sharedData[threadIndex.x] = threadIndex.x;
+
+	GROUP_BARRIER();
+
+	for (uint stride = 512 / 2; stride > 0; stride /= 2)
 	{
-		return;
+		if (threadIndex.x < stride)
+		{
+			sharedData[threadIndex.x] += sharedData[threadIndex.x + stride];
+		}
+
+		GROUP_BARRIER();
 	}
 
-	printf("[ThreadDispatcher] Group %u Thread %u Initialized. \n", groupIndex.x, threadIndex.x);
-	
-	BLOCK_BARRIER();
-
-	for (uint taskIndex = 0; taskIndex < 2; taskIndex++)
+	if (threadIndex.x == 0)
 	{
-		printf("[ThreadDispatcher] Group %u Thread %u Task %u Done. \n", groupIndex.x, threadIndex.x, taskIndex);
-		BLOCK_BARRIER();
+		printf("Final Result: %u\n", sharedData[0]);
 	}
-
-	printf("[ThreadDispatcher] Group %u Thread %u Finalized. \n", groupIndex.x, threadIndex.x);
 }
 Compute_Kernel_End
 
+struct CPUTimer
+{
+	void Start()
+	{
+		mStartTime = std::chrono::system_clock::now();
+		mCapturing = true;
+	}
+
+	void Stop()
+	{
+		mEndTime = std::chrono::system_clock::now();
+		mCapturing = false;
+	}
+
+	// in microseconds
+	float GetElapsedTime() const
+	{
+		std::chrono::time_point<std::chrono::system_clock> endTime;
+		if (mCapturing)
+		{
+			endTime = std::chrono::system_clock::now();
+		}
+		else
+		{
+			endTime = mEndTime;
+		}
+
+		return (float)std::chrono::duration_cast<std::chrono::milliseconds>(endTime - mStartTime).count();
+	}
+
+	std::chrono::time_point<std::chrono::system_clock> mStartTime;
+	std::chrono::time_point<std::chrono::system_clock> mEndTime;
+	bool mCapturing = false;
+};
+
 int main()
 {
-	CPUDispatcher dispatcher(Vector3UInt(8, 1, 1), ComputeKernel_Main);
-	dispatcher.Dispatch(Vector3UInt(2, 1, 1));
+	CPUDispatcher dispatcher(Vector3UInt(512, 1, 1), ComputeKernel_ParallelReduction);
+	dispatcher.SetSharedMemorySize(512 * sizeof(uint));
+	CPUTimer timer;
+	timer.Start();
+	dispatcher.Dispatch(Vector3UInt(1, 1, 1));
+	timer.Stop();
+
+	printf("Parallel Sum takes %f milliseconds\n", timer.GetElapsedTime());
+
+	timer.Start();
+	int res = 0;
+	for (int i = 0; i < 512; i++)
+	{
+		res += i;
+	}
+	printf("Final Result: %u\n", res);
+	timer.Stop();
+	
+	printf("Serial Sum takes %f milliseconds", timer.GetElapsedTime());
 
 	return 0;
 }
