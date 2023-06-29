@@ -27,26 +27,54 @@ struct CPUDispatcher
 {
 	CPUDispatcher(Vector3UInt blockSize, std::function<void(Vector3UInt, Vector3UInt, bool, CPUDispatcher*)> kernel)
 		: mBlockSize(blockSize), mKernel(kernel),
-		mCompletionFunction(CompletionFunction()), mBarrierRed(std::barrier<CompletionFunction>(blockSize.x * blockSize.y * blockSize.z, mCompletionFunction)), mBarrierBlack(std::barrier<CompletionFunction>(blockSize.x * blockSize.y * blockSize.z, mCompletionFunction))
+		mRedCompletionFunction(CompletionFunction(true, this)), 
+		mBlackCompletionFunction(CompletionFunction(false, this))
 	{
-		mThreadGroupRed.reserve(blockSize.x * blockSize.y * blockSize.z);
-		mThreadGroupBlack.reserve(blockSize.x * blockSize.y * blockSize.z);
+		const uint groupThreadCount = blockSize.x * blockSize.y * blockSize.z;
+		mRedAliveThreadCount = groupThreadCount;
+		mBlackAliveThreadCount = groupThreadCount;
+
+		mRedGroupThreadCount = groupThreadCount;
+		mBlackGroupThreadCount = groupThreadCount;
+
+		mRedBarriers.reserve(groupThreadCount);
+		mBlackBarriers.reserve(groupThreadCount);
+
+		for (int i = 1; i <= (groupThreadCount); i++)
+		{
+			mRedBarriers.push_back(std::make_unique<std::barrier<CompletionFunction>>(i, mRedCompletionFunction));
+			mBlackBarriers.push_back(std::make_unique<std::barrier<CompletionFunction>>(i, mBlackCompletionFunction));
+		}
+
+		mThreadGroupRed.reserve(groupThreadCount);
+		mThreadGroupBlack.reserve(groupThreadCount);
 	}
 
 	struct CompletionFunction
 	{
-		CompletionFunction()
+		CompletionFunction(bool isRed, CPUDispatcher* dispatcher)
+			: mIsRed(isRed), mpDispatcher(dispatcher)
 		{
 		}
 
 		void operator()() noexcept
 		{
+			if (mIsRed)
+			{
+				mpDispatcher->mRedGroupThreadCount = mpDispatcher->mRedAliveThreadCount;
+			}
+			else
+			{
+				mpDispatcher->mBlackGroupThreadCount = mpDispatcher->mBlackAliveThreadCount;
+			}
 		}
+
+		bool mIsRed;
+		CPUDispatcher* mpDispatcher;
 	};
 
 	void Dispatch(Vector3UInt groupSize)
 	{
-
 		for (uint gridX = 0; gridX < groupSize.x; gridX++)
 		{
 			for (uint gridY = 0; gridY < groupSize.y; gridY++)
@@ -76,11 +104,11 @@ struct CPUDispatcher
 	{
 		if (useRed)
 		{
-			mBarrierRed.arrive_and_wait();
+			mRedBarriers[mRedGroupThreadCount - 1]->arrive_and_wait();
 		}
 		else
 		{
-			mBarrierBlack.arrive_and_wait();
+			mBlackBarriers[mBlackGroupThreadCount - 1]->arrive_and_wait();
 		}
 	}
 
@@ -88,6 +116,19 @@ struct CPUDispatcher
 	{
 		std::vector<std::thread>& currentThreadGroup = mUseRed ? mThreadGroupRed : mThreadGroupBlack;
 		std::vector<std::thread>& otherThreadGroup = mUseRed ? mThreadGroupBlack : mThreadGroupRed;
+
+		const uint groupThreadCount = mBlockSize.x * mBlockSize.y * mBlockSize.z;
+		
+		if (mUseRed)
+		{
+			mRedAliveThreadCount = groupThreadCount;
+			mRedGroupThreadCount = groupThreadCount;
+		}
+		else
+		{
+			mBlackAliveThreadCount = groupThreadCount;
+			mBlackGroupThreadCount = groupThreadCount;
+		}
 
 		for (uint32_t x = 0; x < mBlockSize.x; x++)
 		{
@@ -108,26 +149,67 @@ struct CPUDispatcher
 	}
 
 	Vector3UInt mBlockSize;
+	
+	std::function<void(Vector3UInt, Vector3UInt, bool, CPUDispatcher*)> mKernel;
 
-	CompletionFunction mCompletionFunction;
+	CompletionFunction mRedCompletionFunction;
+	CompletionFunction mBlackCompletionFunction;
 
-	std::barrier<CompletionFunction> mBarrierRed;
-	std::barrier<CompletionFunction> mBarrierBlack;
+	std::vector<std::unique_ptr<std::barrier<CompletionFunction>>> mRedBarriers;
+	std::vector<std::unique_ptr<std::barrier<CompletionFunction>>> mBlackBarriers;
 
 	bool mUseRed = true;
+
 	std::vector<std::thread> mThreadGroupRed;
 	std::vector<std::thread> mThreadGroupBlack;
 
-	std::function<void(Vector3UInt, Vector3UInt, bool, CPUDispatcher*)> mKernel;
+	std::atomic_uint mRedAliveThreadCount;
+	std::atomic_uint mBlackAliveThreadCount;
+
+	uint mRedGroupThreadCount;
+	uint mBlackGroupThreadCount;
 };
 
-#define BLOCK_BARRIER() dispatcher->GroupSync(useRed)
-#define Compute_Kernel(name) void ComputeKernel_##name(Vector3UInt groupIndex, Vector3UInt threadIndex, bool useRed, CPUDispatcher* dispatcher)
-
-Compute_Kernel(Main)
+#define BLOCK_BARRIER() dispatcher->GroupSync(isRed)
+#define Compute_Kernel_Begin(name)                                                                                    \
+	void ComputeKernel_##name(Vector3UInt groupIndex, Vector3UInt threadIndex, bool isRed, CPUDispatcher* dispatcher) \
+	{                                                                                                                 \
+		KernelScopeGuard scopeGuard(isRed, dispatcher);
+#define Compute_Kernel_End }
+struct KernelScopeGuard
 {
-	printf("[ThreadDispatcher] Group %u Thread %u Initialized. \n", groupIndex.x, threadIndex.x);
+	KernelScopeGuard(bool isRed, CPUDispatcher* dispatcher)
+		: mIsRed(isRed), mpDispatcher(dispatcher)
+	{
+	}
 
+	~KernelScopeGuard()
+	{
+		if (mIsRed)
+		{
+			mpDispatcher->mRedBarriers[mpDispatcher->mRedGroupThreadCount - 1]->arrive_and_drop();
+			mpDispatcher->mRedAliveThreadCount.fetch_sub(1);
+		}
+		else
+		{
+			mpDispatcher->mBlackBarriers[mpDispatcher->mBlackGroupThreadCount - 1]->arrive_and_drop();
+			mpDispatcher->mBlackAliveThreadCount.fetch_sub(1);
+		}
+	}
+
+	bool mIsRed;
+	CPUDispatcher* mpDispatcher;
+};
+
+Compute_Kernel_Begin(Main)
+{
+	if (threadIndex.x >= 4)
+	{
+		return;
+	}
+
+	printf("[ThreadDispatcher] Group %u Thread %u Initialized. \n", groupIndex.x, threadIndex.x);
+	
 	BLOCK_BARRIER();
 
 	for (uint taskIndex = 0; taskIndex < 2; taskIndex++)
@@ -138,6 +220,7 @@ Compute_Kernel(Main)
 
 	printf("[ThreadDispatcher] Group %u Thread %u Finalized. \n", groupIndex.x, threadIndex.x);
 }
+Compute_Kernel_End
 
 int main()
 {
